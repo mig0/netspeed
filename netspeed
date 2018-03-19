@@ -1,0 +1,190 @@
+#!/usr/bin/perl
+
+# netspeed - perform network speed test between any 2 hosts.
+# Copyright (C) 2018 Mikhael Goikhman, migo@cpan.org
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+use strict;
+use warnings;
+
+use Getopt::Long qw(:config no_ignore_case bundling);
+use Time::HiRes qw(time);
+use POSIX qw(strftime);
+use IO::Socket;
+use IO::Select;
+
+my $is_server = 0;
+my $verbose = 0;
+my $quiet = 0;
+my $port = 24336;
+my $size = undef;
+my $time = undef;
+my $MEGA = 1024 * 1024;
+
+sub show_usage (;$) {
+	my $is_error = shift || 0;
+	my $out = $is_error ? \*STDERR : \*STDOUT;
+	my $usage = qq{
+		Usage: $0 [OPTIONS] HOST|-d
+		Perform network speed check against remote server
+
+		Options:
+			-h --help     show this usage
+			-d --daemon   start server
+			-v --verbose  be verbose
+			-q --quiet    be silent; second -q disables errors & stats too
+			-p --port P   server port to use (default: $port)
+
+		Client-only options:
+			-s --size N   limit sending data to size N (default: endless)
+			-t --time S   limit sending data to S sec (default: endless)
+
+		HOST is server name or ip; this is mandatory in client mode.
+		To run a server, specify -d.
+	};
+	$usage =~ s/^\n//; $usage =~ s/^\t\t?//mg;
+	print $out $usage;
+	exit $is_error;
+}
+
+Getopt::Long::GetOptions(
+	'h|help'      => sub { show_usage(0) },
+	'd|daemon'    => \$is_server,
+	'v|verbose+'  => \$verbose,
+	'q|quiet+'    => \$quiet,
+	'p|port=i'    => \$port,
+	's|size=i'    => \$size,
+	't|time=i'    => \$time,
+) or show_usage(1);
+
+# pseudo-random binary block to send/receive
+my $block_size = 4096;
+my $block = pack("C$block_size", map { ($_ * 97) % 256 } 1 .. $block_size);
+
+sub get_time_stats ($$;\$) {
+	my ($bytes, $time_started, $time_now_ref) = @_;
+
+	my $time_now = time;
+	my $time_diff = $time_now - $time_started;
+	$$time_now_ref = $time_now if $time_now_ref;
+
+	return sprintf "%4.3f Mbps (%ld MB in %d s)",
+		$bytes / ($time_diff || 1e-6) / ($MEGA / 8), $bytes / $MEGA, $time_diff;
+}
+
+sub print_log ($;$) {
+	my $msg = shift;
+	my $err_level = shift || 0;
+
+	my $time_str = strftime("%Y-%m-%d %T", localtime());
+	$msg = "\e[31m$msg\e[m" if $err_level;
+
+	print "[$time_str] $msg\n";
+}
+
+sub run_server () {
+	my $socket_pool = IO::Select->new;
+	my $main_socket = IO::Socket::INET->new(Listen => 1, LocalPort => $port, Reuse => 1)
+		or die "Can't bind to port $port: $!\n";
+
+	$socket_pool->add($main_socket);
+
+	print_log "Listening to port $port"
+		unless $quiet;
+
+	sub get_client_label ($) {
+		my $socket = shift;
+		return "client " . $socket->peerhost;
+	}
+
+	my %connect_times;
+	my %transfer_sizes;
+
+	while (my @ready_sockets = $socket_pool->can_read) {
+		foreach my $socket (@ready_sockets) {
+			if ($socket == $main_socket) {
+				my $client_socket = $socket->accept || next;
+				$socket_pool->add($client_socket);
+				my $client_key = $client_socket->fileno;
+				my $client_label = get_client_label($client_socket);
+				print_log "Connected $client_label"
+					unless $quiet;
+				$connect_times{$client_key} = time;
+				$transfer_sizes{$client_key} = 0;
+			} else {
+				my $client_key = $socket->fileno;
+				my $client_label = get_client_label($socket);
+				my $block_read;
+
+				my $len = $socket->read($block_read, $block_size);
+				if (defined $len && $block eq $block_read) {
+					$transfer_sizes{$client_key} += $block_size;
+					next;
+				}
+
+				if ($quiet < 2) {
+					if ($verbose) {
+						if (!defined $len) {
+							print_log "Failed to read from $client_label: $!";
+						} elsif ($len == 0) {
+							print_log "End of data from $client_label";
+						} elsif ($len < $block_size) {
+							print_log "Expected $block_size bytes from $client_label, got $len", 1;
+						}
+					}
+					print_log "Stats for $client_label: " .
+						get_time_stats($transfer_sizes{$client_key}, $connect_times{$client_key});
+				}
+
+				print_log "Disconnected $client_label"
+					unless $quiet;
+				$socket_pool->remove($socket);
+				$socket->close;
+			}
+		}
+	}
+}
+
+sub run_client () {
+	my $host = shift @ARGV;
+	unless ($host) {
+		warn "Missing host argument\n";
+		show_usage(1);
+	}
+
+	my $addr = "$host:$port";
+	my $socket = IO::Socket::INET->new(PeerAddr => $addr, Proto => 'tcp')
+		or die "Can't connect to server $addr: $!\n";
+
+	my $size_sent = 0;
+	my $time_started = time;
+	my $time_printed = $time_started;
+	my $label = "Uploading to $addr";
+
+	my $terminated = 0;
+	local $SIG{INT} = sub { print "\n"; $terminated = 1 };
+
+	until ($terminated || defined $time && time >= $time_started + $time || defined $size && $size_sent >= $size) {
+		$socket->write($block, $block_size) or
+			die "Failed to send block to $addr (successfully sent " . int($size_sent / $MEGA) . " MB), exiting\n";
+		$size_sent += $block_size;
+		if (time - $time_printed >= 10) {
+			printf "$label: %s\n", get_time_stats($size_sent, $time_started, $time_printed);
+		}
+	}
+	printf "Stats for $addr: %s\n", get_time_stats($size_sent, $time_started);
+}
+
+$is_server ? run_server() : run_client();

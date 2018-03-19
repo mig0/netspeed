@@ -1,0 +1,55 @@
+Welcome to netspeed - performing network speed test between any 2 hosts.
+
+Useful to verify, for example, that you have a gigabit connection along all the route.
+
+On one host (say, 10.0.1.8), run a server:
+
+	% netspeed -d
+
+On other hosts, run:
+
+	% netspeed 10.0.1.8
+	Uploading to 10.0.1.8:24336: 895.990 Mbps (1119 MB in 10 s)
+	Uploading to 10.0.1.8:24336: 896.973 Mbps (2242 MB in 20 s)
+	Uploading to 10.0.1.8:24336: 894.552 Mbps (3354 MB in 30 s)
+	^C
+	Stats for 10.0.1.8:24336: 893.540 Mbps (3661 MB in 32 s)
+
+or:
+
+	% netspeed 10.0.1.8 -t 3
+	Stats for 10.0.1.8:24336: 75.524 Mbps (336 MB in 3 s)
+
+The output on the server is:
+
+	% netspeed -d
+	[2018-03-19 18:55:30] Listening to port 24336
+	[2018-03-19 18:55:40] Connected client 10.0.1.1
+	[2018-03-19 18:56:12] Stats for client 10.0.1.1: 893.421 Mbps (3661 MB in 32 s)
+	[2018-03-19 18:56:12] Disconnected client 10.0.1.1
+	[2018-03-19 18:56:52] Connected client 10.0.5.22
+	[2018-03-19 18:56:55] Stats for client 10.0.5.22: 75.422 Mbps (336 MB in 3 s)
+	[2018-03-19 18:56:55] Disconnected client 10.0.5.22
+
+Usage:
+
+	% netspeed -h
+	Usage: netspeed [OPTIONS] HOST|-d
+	Perform network speed check against remote server
+	
+	Options:
+		-h --help     show this usage
+		-d --daemon   start server
+		-v --verbose  be verbose
+		-q --quiet    be silent; second -q disables errors & stats too
+		-p --port P   server port to use (default: 24336)
+	
+	Client-only options:
+		-s --size N   limit sending data to size N (default: endless)
+		-t --time S   limit sending data to S sec (default: endless)
+	
+	HOST is server name or ip; this is mandatory in client mode.
+	To run a server, specify -d.
+
+Author:
+	Mikhael Goikhman <migo@cpan.org>
